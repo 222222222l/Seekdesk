@@ -1,53 +1,94 @@
-"""Read-only loopback static server. No jobs, credentials, or profiles reach this server."""
-from argparse import ArgumentParser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+"""Local job discovery and application workbench."""
+
+import argparse
+import errno
+import json
+import os
+import threading
+import webbrowser
+from contextlib import contextmanager
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.request import urlopen
 
-ROOT = Path(__file__).resolve().parent
-FILES = {"/": ("index.html", "text/html"), "/index.html": ("index.html", "text/html"),
-         "/app.js": ("app.js", "text/javascript"), "/core.js": ("core.js", "text/javascript"),
-         "/fixture.js": ("fixture.js", "text/javascript"), "/style.css": ("style.css", "text/css")}
-POLICY = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; "
-          "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+from desk.engine import Engine
+from desk.storage import Store, digest
+from desk.web import DeskHandler
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.serve()
-    def do_HEAD(self):
-        self.serve(head=True)
-    def do_POST(self):
-        self.send_error(405)
-    def serve(self, head=False):
-        port = self.server.server_port
-        if self.headers.get('Host', '').lower() not in {f'localhost:{port}', f'127.0.0.1:{port}'}:
-            self.send_error(400)
-            return
-        if self.path not in FILES:
-            self.send_error(404)
-            return
-        filename, content_type = FILES[self.path]
-        data = (ROOT / filename).read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Security-Policy", POLICY)
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        if not head:
-            self.wfile.write(data)
-    def log_message(self, _format, *_args):
-        pass
 
-if __name__ == "__main__":
-    parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=8765)
+@contextmanager
+def instance(root):
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (root / "server.lock").open("a+b") as handle:
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit("此数据目录已有工作台在运行，请打开已有窗口。")
+        yield
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int)
+    parser.add_argument(
+        "--data-dir", type=Path, default=Path(__file__).resolve().parent / ".workbench" / "personal"
+    )
+    parser.add_argument("--open", action="store_true")
     args = parser.parse_args()
-    with ThreadingHTTPServer(("127.0.0.1", args.port), Handler) as server:
-        print(f"http://127.0.0.1:{server.server_port} (local-only; Ctrl+C to stop)", flush=True)
+    port_file = args.data_dir / "port"
+    try:
+        saved = int(port_file.read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        saved = 8765
+    port = args.port if args.port is not None else saved
+    if args.open and port:
+        address = f"http://127.0.0.1:{port}/"
+        try:
+            with urlopen(address + "api/health", timeout=0.5) as response:
+                health = json.load(response)
+            if health.get("workspace") == digest(str(args.data_dir.resolve())):
+                webbrowser.open(address)
+                return
+        except (OSError, ValueError):
+            pass
+
+    def listener():
+        try:
+            return ThreadingHTTPServer(("127.0.0.1", port), DeskHandler)
+        except OSError as exc:
+            if (
+                args.port is not None
+                or exc.errno != errno.EADDRINUSE
+                and getattr(exc, "winerror", None) != 10048
+            ):
+                raise
+            return ThreadingHTTPServer(("127.0.0.1", 0), DeskHandler)
+
+    with instance(args.data_dir), listener() as server:
+        port_file.write_text(str(server.server_port), encoding="ascii")
+        server.config_lock = threading.RLock()
+        server.store = Store(args.data_dir)
+        server.engine = Engine(server.store, server.config_lock)
+        threading.Thread(target=server.engine.scheduler, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_port}/"
+        print(url, flush=True)
+        if args.open:
+            webbrowser.open(url)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            server.engine.stop.set()
+
+
+if __name__ == "__main__":
+    main()

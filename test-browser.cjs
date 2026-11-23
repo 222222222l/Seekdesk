@@ -5,24 +5,24 @@ const { chromium }=require('playwright');
 const F=require('./fixture.js');
 const port=process.env.TEST_PORT||'8765', origin='http://127.0.0.1:'+port;
 (async()=>{
-const browser=await chromium.launch({executablePath:process.env.CHROMIUM||'/usr/bin/chromium', args:['--no-sandbox']});
+const browser=await chromium.launch({executablePath:process.env.CHROMIUM});
 try {
  const page=await browser.newPage({viewport:{width:390,height:844}});
  const errors=[],requests=[];
  page.on('pageerror',e=>errors.push(String(e)));
  page.on('request',r=>requests.push(r.url()));
  await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
- await page.goto(origin);
+ await page.goto(origin+'/review.html');
  await page.getByRole('button',{name:'载入公开样本与虚构履历'}).click();
  const states=await page.locator('article').evaluateAll(els=>els.map(e=>e.dataset.state));
  assert.deepEqual(states,F.expected);
  assert.equal(await page.locator('article').count(),5);
  assert.equal(await page.locator('#profile').inputValue(),F.sampleProfile);
  const card=page.locator('article').first();
- await card.getByText('人工进度',{exact:false}).first().click();
+ await card.locator('summary').filter({hasText:'人工进度'}).click();
  await card.getByRole('button',{name:'模拟发送与回执'}).click();
  assert.match(await page.locator('#message').textContent(),/没有外部请求/);
- await card.getByText('人工进度',{exact:false}).first().click();
+ await card.locator('summary').filter({hasText:'人工进度'}).click();
  assert.equal(await card.getByText('模拟回执：',{exact:true}).count(),1);
  assert.equal(await card.getByText('已人工核对平台回执：',{exact:true}).count(),0);
  await page.getByRole('button',{name:'载入公开样本与虚构履历'}).click();
@@ -46,7 +46,7 @@ try {
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
  assert.deepEqual(errors,[]);
  assert(requests.length>0 && requests.every(u=>new URL(u).origin===origin));
- const res=await page.request.get(origin);
+ const res=await page.request.get(origin+'/review.html');
  assert.match(res.headers()['content-security-policy'],/connect-src 'none'/);
  assert.equal((await page.request.get(origin+'/README.md')).status(),404);
  assert.equal((await page.request.post(origin+'/')).status(),405);
