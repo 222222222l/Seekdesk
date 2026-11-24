@@ -71,8 +71,12 @@ def results(base, query, limit=6):
                     raw.extend(chunk)
                     if len(raw) > 3_000_000:
                         raise ValueError("SearXNG 响应超过大小限制")
+        except requests.Timeout as exc:
+            raise ValueError("本地 SearXNG 查询超时，请在「来源与账号」测试搜索并检查上游网络") from exc
+        except requests.ConnectionError as exc:
+            raise ValueError("无法连接本地 SearXNG 地址。若使用 Docker，请确认引擎和搜索容器均已启动") from exc
         except requests.RequestException as exc:
-            raise ValueError("无法查询本地 SearXNG，请检查服务、端口和上游搜索超时") from exc
+            raise ValueError("本地 SearXNG 请求失败，请在「来源与账号」核对实例地址并测试搜索") from exc
     try:
         data = json.loads(raw)
     except (UnicodeError, ValueError) as exc:
@@ -100,7 +104,14 @@ def results(base, query, limit=6):
 
 
 def search(base, query):
-    return [row["url"] for row in results(base, query)]
+    links = []
+    for row in results(base, query):
+        try:
+            if urlsplit(row["url"]).hostname:
+                links.append(row["url"])
+        except ValueError:
+            continue
+    return links
 
 
 def compose_file(project):

@@ -4,15 +4,17 @@ import json
 import os
 import re
 import threading
+from uuid import uuid4
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import backends, models, notifications, platforms, searxng
+from . import backends, filter_assistant, models, notifications, platforms, regions, searxng, sources
 from .engine import message
 from .storage import DEFAULTS, SECRETS, digest, now, rating_context
 
 ROOT = Path(__file__).resolve().parents[1]
+SERVICE_VERSION = "2026-11-24.2"
 STATIC = {
     "index.html",
     "backend-picker.js",
@@ -61,14 +63,24 @@ def validate_settings(payload, current):
             or not cfg["model"]
         ):
             raise ValueError("请填写 HTTPS 模型 API 基址和模型名称，本机模型可用 HTTP")
-    if any(k not in platforms.PLATFORMS for k in cfg["platforms"]):
-        raise ValueError("未知招聘平台")
+    for key, allowed in (("platforms", platforms.PLATFORMS), ("platform_indexes", platforms.INDEX_SITES),
+                         ("employer_indexes", sources.EMPLOYER_INDEXES)):
+        values = cfg[key]
+        if any(not isinstance(k, str) or k not in allowed for k in values) or len(values) != len(set(values)):
+            raise ValueError("招聘平台未知或重复")
+    selected = cfg["source_regions"]
+    if not selected or any(k not in regions.REGIONS for k in selected) or len(selected) != len(set(selected)):
+        raise ValueError("请至少选择一个来源地区，国内和海外可同时勾选")
     for board in cfg["boards"].split():
         if not re.fullmatch(r"(greenhouse|lever):[A-Za-z0-9_-]{1,80}", board):
             raise ValueError("招聘板格式为 greenhouse:公司 或 lever:公司")
-    for url in cfg["sites"].split():
+    for url in (cfg["sites"] + " " + cfg["domestic_sites"] + " " + cfg["overseas_sites"]).split():
         if urlsplit(url).scheme not in ("https", "http") or not urlsplit(url).hostname:
             raise ValueError("请填写完整的招聘官网 URL")
+    if {urlsplit(u).hostname for u in cfg["domestic_sites"].split()} & {
+        urlsplit(u).hostname for u in cfg["overseas_sites"].split()
+    }:
+        raise ValueError("同一企业官网只能归属一个来源地区")
     if cfg["email"] and not re.fullmatch(r"[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+", cfg["email"]):
         raise ValueError("通知邮箱格式不正确")
     if cfg["mail_mode"] not in ("auto", "custom"):
@@ -112,6 +124,10 @@ def model_draft(store, data):
     return {"provider": key, "model": model, "api_url": url, "api_key": secret}
 
 
+def filter_revision(cfg, resume_id):
+    return digest(rating_context(cfg, resume_id), cfg["filter_assistant"].get("version"))
+
+
 class DeskHandler(BaseHTTPRequestHandler):
     def reply(self, status, data, kind="application/json", head=False):
         if kind == "application/json":
@@ -152,7 +168,7 @@ class DeskHandler(BaseHTTPRequestHandler):
             return self.reply(400, {"error": "地址无效"}, head=head)
         path = urlsplit(self.path).path
         if path == "/api/health":
-            return self.reply(200, {"workspace": digest(str(self.server.store.root.resolve()))}, head=head)
+            return self.reply(200, {"workspace": digest(str(self.server.store.root.resolve())), "version": SERVICE_VERSION}, head=head)
         if path == "/api/state":
             return self.reply(200, self.state(), head=head)
         if path == "/api/models":
@@ -185,7 +201,8 @@ class DeskHandler(BaseHTTPRequestHandler):
              json_extract(rating,'$.score') score,json_extract(rating,'$.eligible') eligible,
              json_extract(rating,'$.pref_match') pref_match,
              json_extract(rating,'$.mode') mode,json_extract(rating,'$.reason') reason FROM jobs
-             ORDER BY current DESC,score DESC,active DESC,pref_match DESC,seen DESC,id""",
+             ORDER BY current DESC,score DESC,active DESC,pref_match DESC,
+                      COALESCE(json_array_length(rating,'$.preferred'),0) DESC,seen DESC,id""",
             (current,),
         )
         runs = s.rows("SELECT * FROM runs ORDER BY id DESC LIMIT 30")
@@ -196,23 +213,44 @@ class DeskHandler(BaseHTTPRequestHandler):
                  FROM actions a JOIN jobs j ON a.job=j.id ORDER BY updated DESC LIMIT 150"""
         )
         contacted = s.rows("SELECT count(*) n FROM actions WHERE kind='打招呼' AND state='已完成'")[0]["n"]
+        logins = s.get("logins", {})
+        held = s.get("verification_pending", {})
+        for key in held:
+            logins[key] = "。".join(filter(None, [logins.get(key), platforms.VERIFY_NOTE]))
+        site_urls = set((cfg["sites"] + " " + cfg["domestic_sites"] + " " + cfg["overseas_sites"]).split())
+        active_sources = (
+            sum(regions.includes(cfg, k) and k not in held for k in cfg["platforms"])
+            + (sum(regions.includes(cfg, k) for k in cfg["platform_indexes"] + cfg["employer_indexes"])
+               if s.get(searxng.KEY, {}).get("enabled") else 0)
+            + int(cfg["tencent_careers"] and regions.includes(cfg, "腾讯社招"))
+            + int(cfg["bosch_china"] and regions.includes(cfg, "博世中国岗位"))
+            + sum(regions.includes(cfg, b) for b in set(cfg["boards"].split()))
+            + sum(regions.includes(cfg, "", u) for u in site_urls)
+        )
         return dict(
+            active_source_count=active_sources,
             settings=visible,
+            filter_revision=filter_revision(cfg, s.get("resume")),
             desktop_available=os.name == "nt",
+            review_starts_at_search=True,
+            review_details_in_separate_session=False,
+            manual_review_window=True,
+            passive_platform_review=True,
+            review_window_run=self.server.engine.review_window_run,
             profile=s.profile(),
-            jobs=joblist,
+            jobs=[j for j in joblist if regions.includes(cfg, j["source"], j["url"])],
             runs=runs,
             actions=actions,
             contacted=contacted,
             busy=self.server.engine.lock.locked(),
             phase=self.server.engine.current,
             due=s.get("due", 0),
-            logins={
-                **s.get("logins", {}),
-                **{k: platforms.VERIFY_NOTE for k in s.get("verification_pending", {})},
-            },
+            logins=logins,
+            held_platforms=list(held),
             search_plugins={"searxng": searxng.state(s)},
             platforms={k: v["name"] for k, v in platforms.PLATFORMS.items()},
+            index_platforms={k: v["name"] for k, v in platforms.INDEX_SITES.items()},
+            employer_index_names=list(sources.EMPLOYER_INDEXES),
         )
 
     def do_POST(self):
@@ -242,6 +280,40 @@ class DeskHandler(BaseHTTPRequestHandler):
     def submit(self, data):
         server = self.server
         s = server.store
+        if self.path in ("/api/filters/generate", "/api/filters/clear"):
+
+            def check_revision():
+                cfg = s.settings()
+                if data.get("revision") != filter_revision(cfg, s.get("resume")):
+                    raise ValueError("简历、模型或筛选条件已变更，请刷新页面后重新生成")
+                if server.engine.lock.locked():
+                    raise ValueError("巡查正在运行，请在结束后应用筛选条件")
+                return cfg
+
+            with server.config_lock:
+                cfg = check_revision()
+                if self.path.endswith("/clear"):
+                    server.engine.set_filter_assistant({"version": uuid4().hex})
+                    return {"applied": False}
+                profile = s.profile(full=True)
+                role = models.intended_role(profile["text"]) if profile else ""
+            request = data.get("request")
+            rules = filter_assistant.generate(cfg, request, role)
+            if rules["unresolved"]:
+                return {"applied": False, "unresolved": rules["unresolved"]}
+            with server.config_lock:
+                check_revision()
+                assistant = dict(
+                    version=uuid4().hex,
+                    request=request.strip(),
+                    rules=rules,
+                    provider=cfg["provider"],
+                    model=cfg["model"],
+                )
+                server.engine.set_filter_assistant(assistant)
+            return {"applied": True}
+        if self.path == "/api/jobs/import":
+            return server.engine.import_cards(data.get("text"))
         if self.path == "/api/notifications/test-desktop":
             return {"note": notifications.desktop_notice("求职工作台 · 测试提醒", "这是本机测试通知。")}
         if self.path == "/api/run":
@@ -254,9 +326,23 @@ class DeskHandler(BaseHTTPRequestHandler):
                     raise ValueError("请选择可复查的平台")
                 if data.get("interactive") and key == "selected":
                     raise ValueError("一次只能打开一个官网复查窗口")
+                if key in platforms.PLATFORMS and not regions.includes(s.settings(), key):
+                    raise ValueError("请先在来源与账号启用国内平台")
                 server.engine.start("只读复查", key, data.get("interactive", False))
             else:
                 server.engine.start()
+        elif self.path == "/api/platform/resume":
+            key = data.get("platform")
+            if key not in platforms.PLATFORMS:
+                raise ValueError("未知平台")
+            with server.config_lock:
+                if server.engine.lock.locked() or platforms.LOCKS[key].locked():
+                    raise ValueError("请在巡查结束并关闭平台窗口后恢复")
+                pending = s.get("verification_pending", {})
+                pending.pop(key, None)
+                s.put("verification_pending", pending)
+        elif self.path == "/api/review/finish":
+            server.engine.finish_review(data.get("run"))
         elif self.path in ("/api/models/scan", "/api/models/use", "/api/models/test"):
             cfg = model_draft(s, data)
             key = cfg["provider"]
@@ -341,8 +427,11 @@ class DeskHandler(BaseHTTPRequestHandler):
                 raise ValueError("未知平台")
             search = s.get("last_search." + key) if data.get("purpose") == "search" else None
             if data.get("purpose") == "search" and not search:
+                cfg = s.settings()
+                rules = cfg.get("filter_assistant", {}).get("rules")
                 search = platforms.platform_term(
-                    s.settings()["keywords"] or "招聘", s.settings()["location"], True
+                    rules["queries"][0] if rules else cfg["keywords"] or "招聘",
+                    "、".join(rules["cities"]) if rules else cfg["location"],
                 )
 
             def status(label):
@@ -351,8 +440,10 @@ class DeskHandler(BaseHTTPRequestHandler):
 
             def launch():
                 try:
-                    platforms.login_window(s.root, key, status, search)
-                    status("窗口已关闭 · 巡查时核验")
+                    restored = platforms.login_window(s.root, key, status, search)
+                    status(
+                        "窗口已关闭，已启用本机会话恢复" if restored else "窗口已关闭，浏览器未启用会话恢复"
+                    )
                 except platforms.BrowserError as e:
                     if "Executable doesn't exist" in str(e):
                         status("缺少专属浏览器，请运行启动工作台.cmd 安装 Chromium")

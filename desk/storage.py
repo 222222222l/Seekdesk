@@ -41,14 +41,31 @@ DEFAULTS = dict(
     tavily_key="",
     boards="greenhouse:gitlab\nlever:spotify",
     sites="",
+    domestic_sites="",
+    overseas_sites="",
+    source_regions=["domestic", "overseas"],
     platforms=[],
+    platform_indexes=["boss", "liepin", "zhilian", "51job"],
+    tencent_careers=False,
+    bosch_china=False,
+    employer_indexes=["腾讯社招", "字节跳动社招", "网易招聘"],
     daily_limit=5,
 )
 SECRETS = {"api_key", "smtp_password", "brave_key", "tavily_key"}
 
 
 def rating_context(cfg, resume_id):
-    return digest(resume_id, cfg["provider"], cfg["model"], cfg["api_url"], cfg["keywords"], cfg["location"])
+    base = digest(
+        "matching-v2",
+        resume_id,
+        cfg["provider"],
+        cfg["model"],
+        cfg["api_url"],
+        cfg["keywords"],
+        cfg["location"],
+    )
+    rules = cfg.get("filter_assistant", {}).get("rules")
+    return digest(base, rules) if rules else base
 
 
 def job_id(item):
@@ -108,7 +125,9 @@ class Store:
 
     def put(self, key, value):
         if key == "settings":
-            value = {k: transform(v) if k in SECRETS else v for k, v in value.items()}
+            value = {
+                k: transform(v) if k in SECRETS else v for k, v in value.items() if k != "filter_assistant"
+            }
             with self.db() as db:
                 previous = db.execute("SELECT value FROM kv WHERE key='settings'").fetchone()
                 previous = json.loads(previous["value"]) if previous else {}
@@ -131,6 +150,7 @@ class Store:
     def settings(self):
         saved = self.get("settings", {})
         cfg = {**DEFAULTS, **saved}
+        cfg["filter_assistant"] = self.get("filter_assistant", {})
         if "mail_mode" not in saved and (cfg["smtp_host"] or cfg["smtp_user"]):
             cfg["mail_mode"] = "custom"
         for key in SECRETS:

@@ -13,7 +13,7 @@ from urllib.request import urlopen
 
 from desk.engine import Engine
 from desk.storage import Store, digest
-from desk.web import DeskHandler
+from desk.web import DeskHandler, SERVICE_VERSION
 
 
 @contextmanager
@@ -55,6 +55,8 @@ def main():
             with urlopen(address + "api/health", timeout=0.5) as response:
                 health = json.load(response)
             if health.get("workspace") == digest(str(args.data_dir.resolve())):
+                if health.get("version") != SERVICE_VERSION:
+                    raise SystemExit("旧版工作台服务仍在运行。请在原启动窗口按 Ctrl+C 退出，再运行「启动工作台.cmd」。")
                 webbrowser.open(address)
                 return
         except (OSError, ValueError):

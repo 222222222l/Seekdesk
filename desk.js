@@ -65,7 +65,8 @@ let state,
   kind = "all",
   page = 1,
   timer,
-  refreshing = false;
+  refreshing = false,
+  lastJobsMarkup = "";
 const view = $("#view");
 const badge = (label, cls = "") =>
   '<span class="badge ' + cls + '">' + esc(label) + "</span>";
@@ -119,7 +120,7 @@ function empty(i, title, desc, action = "") {
 }
 function sourceName(s) {
   return (
-    state.platforms[s] ||
+    state.platforms[s] || state.index_platforms?.[s] ||
     (s.startsWith("greenhouse:")
       ? "Greenhouse"
       : s.startsWith("lever:")
@@ -214,20 +215,29 @@ function step(i, title, desc, to) {
 function sourceCount() {
   const c = state.settings;
   return (
-    c.platforms.length +
+    (state.active_source_count ?? (c.platforms.length +
     c.boards.split(/\s+/).filter(Boolean).length +
-    c.sites.split(/\s+/).filter(Boolean).length +
+    c.sites.split(/\s+/).filter(Boolean).length)) +
     Number(c.brave_key_set) +
     Number(c.tavily_key_set) +
     Number(Boolean(state.search_plugins?.searxng?.enabled))
   );
 }
+function passesGate(j) {
+  return (
+    j.active &&
+    j.current &&
+    j.pref_match &&
+    j.eligible &&
+    !leadLabel(j.mode) &&
+    j.mode !== "preliminary" &&
+    j.score >= state.settings.threshold
+  );
+}
 function overview() {
   const c = state.settings,
     active = state.jobs.filter((j) => j.active),
-    good = active.filter(
-      (j) => j.current && j.pref_match && j.eligible && j.score >= c.threshold,
-    );
+    good = active.filter(passesGate);
   const a = state.contacted;
   const hero =
     '<div class="hero"><div class="hero-copy"><span class="hero-status">' +
@@ -268,15 +278,17 @@ function overview() {
     metric("message", "已联系 HR", a, "amber") +
     '</div><div class="columns"><section class="panel">' +
     hdr("匹配机会", link("全部岗位", "jobs")) +
-    (active.length
-      ? active.slice(0, 5).map(jobRow).join("")
+    (good.length
+      ? good.slice(0, 5).map(jobRow).join("")
       : empty(
           "search",
-          "还没有岗位机会",
+          "暂无达到匹配门槛的岗位",
           state.profile
-            ? "运行一次巡查，查看匹配岗位和原文证据。"
-            : "首次巡查完成后，这里会显示匹配度最高的岗位。",
-          state.profile ? runButton() : link("设置岗位来源", "sources"),
+            ? "这里仅显示符合求职偏好、证据充分且达到分数门槛的在招岗位。"
+            : "上传简历后可按你的经历筛选岗位。",
+          state.profile
+            ? link("查看全部岗位", "jobs")
+            : link("上传简历", "resume"),
         )) +
     '</section><div class="stack"><section class="panel">' +
     hdr("工作台设置") +
@@ -294,17 +306,54 @@ function overview() {
     "</div></div>"
   );
 }
+function runJobs(r) {
+  if (r.reports.some((s) => Array.isArray(s.added))) {
+    const inScope = new Set(state.jobs.map(j => j.id));
+    return new Set(
+      r.reports.flatMap((s) => [...(s.added || []), ...(s.updated || [])]).filter(id => inScope.has(id)),
+    );
+  }
+  // Older services recorded first discovery time but no content-change history.
+  const next = state.runs.findLast((other) => other.id > r.id);
+  return new Set(
+    state.jobs
+      .filter(
+        (j) =>
+          j.first_seen >= r.start &&
+          (!r.end || j.first_seen <= r.end) &&
+          (!next || j.first_seen < next.start),
+      )
+      .map((j) => j.id),
+  );
+}
 function jobs() {
+  const params = new URLSearchParams(location.hash.split("?")[1]);
+  const runId = params.get("run"),
+    assistantView = params.get("assistant") === "1";
+  if (assistantView && !state.settings.filter_assistant?.rules)
+    return empty(
+      "target",
+      "尚未启用筛选助手",
+      "",
+      link("设置求职需求", "resume"),
+    );
+  const run = state.runs.find((r) => String(r.id) === runId);
+  const ids = run ? runJobs(run) : null;
+  if (runId && !run)
+    return empty(
+      "clock",
+      "巡查记录已超出最近记录范围",
+      "",
+      link("查看全部岗位", "jobs"),
+    );
   const visible = state.jobs.filter(
     (j) =>
+      (!ids || ids.has(j.id)) &&
+      (!assistantView || (j.active && j.current && j.pref_match)) &&
       (kind === "all" ||
         (kind in matchLevels && j.current && matchLevel(j.score) === kind) ||
         (kind === "match"
-          ? j.active &&
-            j.current &&
-            j.pref_match &&
-            j.eligible &&
-            j.score >= state.settings.threshold
+          ? passesGate(j)
           : kind === "inactive" && !j.active)) &&
       [j.title, j.company, j.location, j.source, sourceName(j.source)]
         .join(" ")
@@ -315,8 +364,23 @@ function jobs() {
   page = Math.min(page, pages);
   return (
     '<section class="panel">' +
-    hdr("岗位清单", state.profile ? runButton() : link("上传简历", "resume")) +
-    '<p class="hint">按当前简历的匹配分从高到低排列。待核实职位根据已有标题和摘要初评。</p>' +
+    hdr(
+      run
+        ? time(run.start) + " 巡查结果"
+        : assistantView
+          ? "符合助手条件的岗位"
+          : "岗位清单",
+      run || assistantView
+        ? link("查看全部岗位", "jobs")
+        : state.profile
+          ? runButton()
+          : link("上传简历", "resume"),
+    ) +
+    '<p class="hint">按当前简历的匹配分从高到低排列。 ' +
+    link("用自然语言筛选", "resume?assistant=1") +
+    (state.settings.source_regions ? " · " + link("来源范围：" +
+      state.settings.source_regions.map(r => r === "domestic" ? "国内" : "海外").join("、"), "sources") : "") +
+    "</p>" +
     '<div class="filter"><input id="search" aria-label="搜索岗位" placeholder="搜索职位、公司或地区" value="' +
     esc(query) +
     '"><select id="job-filter" aria-label="匹配筛选">' +
@@ -362,6 +426,41 @@ function jobs() {
     "</section>"
   );
 }
+function reportText(s) {
+  const phase = s.phase ? s.phase + " · " : "";
+  const navigation = s.navigation ? "官网顶层页面响应 " + s.navigation.documents +
+    " 次，HTTP 重定向 " + s.navigation.redirects + " 次" +
+    (s.navigation.last_status ? "，最后响应 HTTP " + s.navigation.last_status : "") : "";
+  if (s.outcome === "skipped") return phase + s.note;
+  if (s.error && !s.count) return phase + [s.error, navigation].filter(Boolean).join("。");
+  const parts = [`读取 ${s.count} 个岗位`];
+  if (Array.isArray(s.added)) {
+    parts.push(
+      `新增 ${s.added.length} 个`,
+      `内容更新或重新开放 ${s.updated.length} 个`,
+      `已有 ${s.unchanged} 个`,
+    );
+  }
+  if (s.qualified !== undefined) {
+    parts.push(`索引线索 ${s.index_leads} 个`, `待核实卡片 ${s.cards} 个`, `完整岗位 ${s.full} 个`, `通过门槛 ${s.qualified} 个`);
+  } else {
+    if (s.evaluated) parts.push(`完整岗位已评分 ${s.evaluated} 个`);
+    if (s.leads) parts.push(`待核实线索 ${s.leads} 个`);
+  }
+  if (s.filtered)
+    parts.push(
+      (s.retained ? "已保留偏好外岗位 " : "地点或关键词筛除 ") +
+        s.filtered +
+        " 个",
+    );
+  return phase + [parts.join("，"), s.note, s.error, navigation].filter(Boolean).join("。");
+}
+
+function runResultsLink(r) {
+  const count = runJobs(r).size;
+  return count ? link("查看本轮岗位（" + count + "）", "jobs?run=" + r.id) : "";
+}
+
 function activity() {
   const actions = state.actions
     .map(
@@ -399,7 +498,7 @@ function activity() {
         '<details class="feed" data-run="' +
         r.id +
         '" ' +
-        (expandedRuns.has(String(r.id)) ? "open" : "") +
+        (state.review_window_run === r.id || expandedRuns.has(String(r.id)) ? "open" : "") +
         "><summary>" +
         badge(r.status, r.status === "完成" ? "good" : "warn") +
         "<b>" +
@@ -407,9 +506,11 @@ function activity() {
         "巡查</b> · " +
         time(r.start) +
         "</summary>" +
+        runResultsLink(r) +
         (!r.end && state.phase
           ? '<p class="hint">' + esc(state.phase) + "</p>"
           : "") +
+        (state.review_window_run === r.id ? button("完成窗口核对", "finish-review-" + r.id) : "") +
         "<ul>" +
         r.reports
           .map(
@@ -417,23 +518,7 @@ function activity() {
               "<li>" +
               esc(sourceName(s.source)) +
               " · " +
-              esc(
-                s.error ||
-                  "读取 " +
-                    s.count +
-                    " 个岗位" +
-                    (s.evaluated == null
-                      ? ""
-                      : "，已评估 " + s.evaluated + " 个") +
-                    (s.leads ? "，待核实线索 " + s.leads + " 个" : "") +
-                    (s.filtered
-                      ? (s.retained
-                          ? "，已保留偏好外岗位 "
-                          : "，地点或关键词筛除 ") +
-                        s.filtered +
-                        " 个"
-                      : ""),
-              ) +
+              esc(reportText(s)) +
               (s.error && state.platforms[s.source]
                 ? " " +
                   button("在专属浏览器核对搜索页", "searchpage-" + s.source)
@@ -473,6 +558,71 @@ function activity() {
     "</section>"
   );
 }
+function filterAssistant() {
+  const cfg = state.settings,
+    active = cfg.filter_assistant,
+    rules = active?.rules;
+  const labels = {
+    titles: "目标职能（任一）",
+    any_terms: "方向词（任一）",
+    all_terms: "必备词（全部）",
+    exclude_titles: "排除职能",
+    exclude_terms: "排除内容",
+    cities: "工作城市",
+    prefer: "同分时优先",
+    queries: "轮换搜索词",
+  };
+  const rows = rules
+    ? Object.entries(labels)
+        .filter(([k]) => rules[k].length)
+        .map(
+          ([k, label]) =>
+            "<li>" + esc(label) + "：" + esc(rules[k].join("、")) + "</li>",
+        )
+        .join("")
+    : "";
+  const ready = state.filter_revision && cfg.provider !== "local";
+  return (
+    '<section class="panel" id="filter-assistant">' +
+    hdr("自然语言筛选助手", rules ? badge("已启用", "good") : "") +
+    (rules
+      ? "<p>上次需求：" +
+        esc(active.request) +
+        "</p><ul>" +
+        rows +
+        (rules.min_monthly_cny
+          ? "<li>公告月薪下限：" + esc(rules.min_monthly_cny) + " 元</li>"
+          : "") +
+        "</ul>" +
+        link(
+          "查看符合条件的岗位（" +
+            state.jobs.filter((j) => j.active && j.current && j.pref_match)
+              .length +
+            "）",
+          "jobs?assistant=1",
+        )
+      : "") +
+    '<form data-form="assistant" data-revision="' +
+    esc(state.filter_revision) +
+    '"><label class="field">' +
+    (rules ? "补充或修改需求" : "描述你想找的岗位") +
+    '<textarea name="request" maxlength="2000" required placeholder="例如：找上海或杭州的 AI 产品经理，岗位要涉及 AIGC 或智能体，排除工业设计，优先游戏业务。"></textarea></label>' +
+    '<p class="hint">' +
+    (!state.filter_revision
+      ? "请退出并重新启动工作台服务以启用筛选助手。"
+      : !ready
+        ? "请先在「模型与任务」选用模型 API 或 Agent CLI。"
+        : "使用 " +
+          esc(cfg.model || cfg.provider) +
+          " 生成条件，立即筛选已保存岗位，并用于后续巡查。") +
+    "</p>" +
+    '<button class="btn primary" type="submit"' +
+    (ready ? "" : " disabled") +
+    ">生成并应用条件</button> " +
+    (rules ? button("停用并恢复手动偏好", "clear-filters") : "") +
+    '<p class="hint" role="status"></p></form></section>'
+  );
+}
 function resume() {
   const p = state.profile;
   return (
@@ -492,13 +642,19 @@ function resume() {
     '<label class="upload" id="drop"><span class="tint">' +
     icon("upload") +
     '</span><b>选择或拖入简历文件</b><span class="hint">PDF、DOCX、TXT、MD · 最大 6 MB</span><input type="file" id="upload" accept=".pdf,.docx,.txt,.md"></label><p class="hint">工作台保留原件用于受邀投递。选用外部模型时，简历文本会发送给所选模型。</p></section><section class="panel">' +
-    hdr("求职偏好") +
+    hdr(
+      state.settings.filter_assistant?.rules
+        ? "手动偏好（停用助手后生效）"
+        : "求职偏好",
+    ) +
     '<form data-form="prefs"><div class="formgrid">' +
     field("keywords", "职位关键词", "text", "如 数据分析、产品经理") +
     field("location", "工作地点", "text", "如 上海，留空不限地区") +
-    '</div><p class="hint">多个关键词用空格或逗号分隔，命中其一即可。留空时由模型从简历提取搜索词。</p>' +
+    '</div><p class="hint">多个职位方向或城市可用顿号分隔，例如「AIGC、agent」和「上海、杭州」。每项偏好命中其一即可。留空时根据简历寻找岗位。</p>' +
     save("保存偏好") +
-    "</form></section></div>"
+    "</form></section>" +
+    filterAssistant() +
+    "</div>"
   );
 }
 function field(k, label, type = "text", placeholder = "", wide = false) {
@@ -592,10 +748,22 @@ function searchPluginPanel() {
 }
 function sourcesPage() {
   const c = state.settings;
+  const regionPanel = region => '<section class="panel" data-source-region="' + region + '" ' +
+    (c.source_regions && !c.source_regions.includes(region) ? "hidden" : "") + '>';
   return (
     '<form class="stack" data-form="sources"><section class="panel">' +
-    hdr("招聘平台") +
-    '<p class="hint">首次登录后关闭窗口，再勾选加入巡查。如果官网要求验证，可点「可见窗口复查」，在三分钟内完成官网提示并保持搜索页打开。复查只读取岗位。</p><div class="cards">' +
+    hdr("来源地区") +
+    (c.source_regions
+      ? '<div class="checks">' + [["domestic", "国内平台"], ["overseas", "海外平台"]].map(([value, name]) =>
+          '<label class="check"><input type="checkbox" name="source_region" value="' + value + '" ' +
+          (c.source_regions.includes(value) ? "checked" : "") + '>' + name + '</label>').join("") +
+        '</div><p class="hint">可同时勾选。地区按发布网站划分，工作地点由求职偏好单独筛选。</p>'
+      : '<p role="status">请重启工作台服务以启用来源地区筛选和免登录巡查。</p>') +
+    '</section>' + regionPanel("domestic") + hdr("国内招聘平台") +
+    (state.index_platforms
+      ? ""
+      : '<p role="status">工作台服务仍是旧版。请在原启动窗口按 Ctrl+C，再运行「启动工作台.cmd」以启用新版巡查。</p>') +
+    '<p class="hint">复查读取当前页面已有的卡片和职位信息。需要更多详情时可手动打开岗位，随后关闭窗口或点「完成窗口核对」。遇到验证会停止并保留已读岗位。</p><div class="cards">' +
     Object.entries(state.platforms)
       .map(
         ([k, n]) =>
@@ -607,25 +775,40 @@ function sourcesPage() {
           k +
           '" ' +
           (c.platforms.includes(k) ? "checked" : "") +
-          ">加入巡查</label>" +
+          ">启用平台官网直连巡查</label>" +
           button("打开平台登录", "login-" + k, "arrow") +
-          button("可见窗口复查", "preview-" + k) +
+          (state.index_platforms ? button("可见窗口复查", "preview-" + k) : "") +
+          (state.held_platforms?.includes(k) ? button("我已核对，解除后台直连暂停", "release-" + k) : "") +
           "</div>",
       )
       .join("") +
-    "</div></section>" +
-    '<section class="panel">' +
-    hdr("企业官网与招聘板") +
+    '</div>' +
+    (state.index_platforms ? '<h3>公开岗位索引</h3><p class="hint">' +
+      (state.search_plugins?.searxng?.enabled ? "本地 SearXNG 已启用。" : "请在本页下方启用本地 SearXNG，使所选索引生效。") +
+      '可单独勾选，平台直连暂停时仍收集公开搜索结果。</p><div class="checks">' +
+      Object.entries(state.index_platforms).map(([key, name]) => '<label class="check"><input type="checkbox" name="platform_index" value="' +
+        esc(key) + '" ' + (c.platform_indexes.includes(key) ? 'checked' : '') + '>' + esc(name) + '</label>').join("") +
+      '</div><h3>企业官网索引</h3><div class="checks">' +
+      state.employer_index_names.map(name => '<label class="check"><input type="checkbox" name="employer_index" value="' +
+        esc(name) + '" ' + (c.employer_indexes.includes(name) ? 'checked' : '') + '>' + esc(name) + '</label>').join("") +
+      '</div><h3>企业官网直连</h3>' + check("bosch_china", "博世中国岗位（官方招聘系统）") +
+      check("tencent_careers", "腾讯社招官网（试用，按岗位关键词搜索）") : "") +
     '<div class="formgrid">' +
-    field("boards", "公开招聘板", "textarea", "greenhouse:gitlab", true) +
-    field(
+    (c.source_regions ? field("domestic_sites", "国内企业招聘官网", "textarea", "每行一个招聘页 URL", true) : "") +
+    "</div></section>" +
+    regionPanel("overseas") +
+    hdr("海外招聘平台") +
+    '<div class="formgrid">' +
+    field("boards", "Greenhouse / Lever 公开招聘板", "textarea", "greenhouse:gitlab", true) +
+    (c.source_regions ? field("overseas_sites", "海外企业招聘官网", "textarea", "每行一个招聘页 URL", true) : "") +
+    '</div></section><section class="panel">' + hdr("其他企业官网") + '<div class="formgrid">' + field(
       "sites",
-      "企业招聘页 URL",
+      "未手动分类的官网",
       "textarea",
       "每行一个招聘官网或职位详情 URL",
       true,
     ) +
-    '</div><p class="hint">招聘板填写 greenhouse:企业标识 或 lever:企业标识，每行一个。官网支持 JobPosting 结构化职位。</p></section>' +
+    '</div><p class="hint">未知归属的网站只在同时选择国内和海外时纳入。可将网址移入上方相应地区。</p></section>' +
     '<section class="panel">' +
     hdr("聚合搜索引擎") +
     '<div class="formgrid">' +
@@ -636,6 +819,11 @@ function sourcesPage() {
     "</section>" +
     save("保存岗位来源") +
     "</form>" +
+    (state.index_platforms && c.source_regions.includes("domestic")
+      ? '<form data-form="import-cards" class="panel">' + hdr("导入已收藏的岗位") +
+        '<label class="field">每行填写岗位名称、空格和职位详情链接<textarea required name="text" rows="3" maxlength="100000" placeholder="岗位名称 https://…"></textarea></label>' +
+        '<p class="hint">支持上方四家平台。只在本机保存为待核实卡片，最多 100 行，相同链接会合并。</p>' +
+        save("导入岗位") + '</form>' : "") +
     searchPluginPanel()
   );
 }
@@ -678,7 +866,7 @@ function settings() {
     "</div></section>" +
     '<section class="panel">' +
     hdr("求职提醒") +
-    '<p class="hint">收到交换联系方式请求，或发现需要准备材料的匹配官网岗位时提醒你。</p>' +
+    '<p class="hint">定时巡查读取公开岗位。开启自动联系后，达到门槛且有简历证据的完整平台岗位才使用已保存的登录资料联系 HR。收到待处理的简历邀请或确认发送后提醒。Windows 上未配置可用邮件时，投递提醒自动使用本机弹窗。</p>' +
     (state.desktop_available
       ? '<div class="actions">' +
         check("windows_notifications", "Windows 桌面通知") +
@@ -713,7 +901,7 @@ function settings() {
   );
 }
 function render() {
-  route = location.hash.slice(1);
+  route = location.hash.slice(1).split("?")[0];
   if (!Object.hasOwn(titles, route)) route = "overview";
   $("#crumb").textContent = $("#heading").textContent = titles[route][0];
   $("#subtitle").textContent = titles[route][1];
@@ -725,7 +913,7 @@ function render() {
   document
     .querySelectorAll("nav a")
     .forEach((a) => a.classList.toggle("active", a.hash === "#" + route));
-  view.innerHTML = {
+  const markup = {
     overview,
     jobs,
     activity,
@@ -733,6 +921,10 @@ function render() {
     sources: sourcesPage,
     settings,
   }[route]();
+  view.innerHTML = markup;
+  if (location.hash === "#resume?assistant=1")
+    $("#filter-assistant").scrollIntoView();
+  if (route === "jobs") lastJobsMarkup = markup;
   if (route === "settings")
     BackendPicker.mount($("#backend-panel"), {
       api,
@@ -770,7 +962,12 @@ async function detail(id) {
             ? "本地初评"
             : r.mode + " 模型",
     ) +
-    (r.pref_match === false ? " " + badge("地点或关键词偏好外") : "") +
+    (r.preferred?.length
+      ? " " + badge("偏好命中：" + r.preferred.join("、"))
+      : "") +
+    (r.pref_match === false
+      ? " " + badge(r.gate_reason || "地点或关键词偏好外")
+      : "") +
     (leadLabel(r.mode)
       ? [
           ["初评依据", r.reason],
@@ -842,6 +1039,13 @@ view.addEventListener("click", async (e) => {
       return;
     }
     const a = b.dataset.act;
+    if (a === "clear-filters") {
+      b.disabled = true;
+      await api("filters/clear", { revision: b.form.dataset.revision });
+      await refresh();
+      toast("已恢复手动偏好并重新筛选岗位");
+      return;
+    }
     if (a === "test-desktop") {
       b.disabled = true;
       try {
@@ -902,11 +1106,22 @@ view.addEventListener("click", async (e) => {
       toast("正在打开专属登录窗口，请留意平台卡片上的状态");
     }
     if (a?.startsWith("preview-")) {
+      if (!state.index_platforms) return toast("请重启工作台服务以启用新版巡查");
       await api("run", { platform: a.slice(8), interactive: true });
       tab = "runs";
       location.hash = "activity";
       await refresh();
-      toast("正在打开官网搜索窗口，完成验证后请保持页面打开，等待读取");
+      toast("正在打开官网搜索窗口。读到卡片后可查看岗位，完成后关闭窗口或在巡查记录结束核对");
+    }
+    if (a?.startsWith("release-")) {
+      await api("platform/resume", {platform: a.slice(8)});
+      await refresh();
+      toast("后台暂停已解除，下轮按已保存的直连设置执行");
+      return;
+    }
+    if (a?.startsWith("finish-review-")) {
+      await api("review/finish", {run: Number(a.slice("finish-review-".length))});
+      await refresh();
     }
     if (a?.startsWith("searchpage-")) {
       await api("login", { platform: a.slice(11), purpose: "search" });
@@ -933,6 +1148,9 @@ view.addEventListener("input", (e) => {
   }
 });
 view.addEventListener("change", (e) => {
+  if (e.target.name === "source_region") {
+    e.target.form.querySelector('[data-source-region="' + e.target.value + '"]').hidden = !e.target.checked;
+  }
   if (e.target.name === "email_enabled") {
     const options = $("#mail-options");
     options.disabled = options.hidden = !e.target.checked;
@@ -968,13 +1186,50 @@ view.addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = e.target;
   if (!form.dataset.form) return;
+  if (form.dataset.form === "import-cards") {
+    const submit = form.querySelector("[type=submit]");
+    submit.disabled = true;
+    try {
+      const result = await api("jobs/import", {text: form.elements.text.value});
+      form.reset();
+      await refresh();
+      toast(`已新增 ${result.added} 个岗位，已有 ${result.existing} 个`);
+    } catch (err) { toast(err.message); }
+    finally { submit.disabled = false; }
+    return;
+  }
+  if (form.dataset.form === "assistant") {
+    const status = form.querySelector('[role="status"]');
+    const controls = Array.from(form.querySelectorAll("button,textarea"));
+    controls.forEach((el) => (el.disabled = true));
+    status.textContent = "模型正在解析需求…";
+    try {
+      const response = await api("filters/generate", {
+        request: form.elements.request.value,
+        revision: form.dataset.revision,
+      });
+      if (!response.applied) {
+        status.textContent =
+          "以下要求暂时无法自动执行，请调整表述。现有条件已保留：" +
+          response.unresolved.join("；");
+      } else {
+        await refresh();
+        toast("筛选条件已生效");
+      }
+    } catch (err) {
+      status.textContent = err.message;
+    } finally {
+      controls.forEach((el) => (el.disabled = false));
+    }
+    return;
+  }
   const data = {};
   for (const input of form.elements) {
     if (
       !input.name ||
       input.matches(":disabled") ||
       input.name.startsWith("clear_") ||
-      input.name === "platform"
+      ["platform", "platform_index", "employer_index", "source_region"].includes(input.name)
     )
       continue;
     if (input.type === "password" && !input.value) continue;
@@ -989,10 +1244,19 @@ view.addEventListener("submit", async (e) => {
     "[name^=clear_]:checked:not(:disabled)",
   ))
     data[el.name.slice(6)] = "";
-  if (form.dataset.form === "sources")
+  if (form.dataset.form === "sources") {
+    if (state.index_platforms) {
+      data.platform_indexes = [...form.querySelectorAll("[name=platform_index]:checked")].map(v => v.value);
+      data.employer_indexes = [...form.querySelectorAll("[name=employer_index]:checked")].map(v => v.value);
+    }
     data.platforms = [...form.querySelectorAll("[name=platform]:checked")].map(
       (v) => v.value,
     );
+    if (state.settings.source_regions) {
+      data.source_regions = [...form.querySelectorAll("[name=source_region]:checked")].map(v => v.value);
+      if (!data.source_regions.length) return toast("请至少选择一个来源地区");
+    }
+  }
   const submit = form.querySelector("[type=submit]");
   submit.disabled = true;
   try {
@@ -1006,9 +1270,14 @@ view.addEventListener("submit", async (e) => {
 });
 $("#close-detail").onclick = () => $("#detail").close();
 window.addEventListener("hashchange", () => {
+  if (location.hash.startsWith("#jobs?")) {
+    query = "";
+    kind = "all";
+    page = 1;
+  }
   if (state) {
     render();
-    window.scrollTo(0, 0);
+    if (location.hash !== "#resume?assistant=1") window.scrollTo(0, 0);
   }
 });
 refresh().catch((e) => {
@@ -1019,10 +1288,15 @@ setInterval(async () => {
   if (refreshing || document.hidden || $("#detail").open) return;
   refreshing = true;
   try {
-    const draw =
-      ["overview", "activity"].includes(route) ||
-      (route === "jobs" && state?.busy && !$("#search")?.matches(":focus"));
+    const draw = ["overview", "activity"].includes(route);
     await refresh(draw);
+    if (route === "jobs" && !view.querySelector("input:focus,select:focus")) {
+      const markup = jobs();
+      if (markup !== lastJobsMarkup) {
+        view.innerHTML = markup;
+        lastJobsMarkup = markup;
+      }
+    }
     if (route === "sources") {
       for (const [key, label] of Object.entries(state.logins)) {
         const b = view.querySelector('[data-act="login-' + key + '"]');
